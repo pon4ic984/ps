@@ -1,88 +1,63 @@
-// Vercel Serverless Function: /api/create-payment
-// Creates a YooKassa payment and returns { payment_id, confirmation_url }.
-// Env required:
-//   YOOKASSA_SHOP_ID
-//   YOOKASSA_SECRET_KEY
-// Optional:
-//   SITE_URL (e.g. https://ugolek.example.com) - used for return_url if Origin header is absent.
+const crypto = require("crypto");
 
-import crypto from "crypto";
-
-const YOOKASSA_API = "https://api.yookassa.ru/v3";
-
-function json(res, status, obj) {
-  res.statusCode = status;
-  res.setHeader("Content-Type", "application/json; charset=utf-8");
-  res.end(JSON.stringify(obj));
+function cors(req, res) {
+  const origin = req.headers.origin || "";
+  const allow = process.env.SITE_URL || "*";
+  res.setHeader("Access-Control-Allow-Origin", allow === "*" ? "*" : origin);
+  res.setHeader("Vary", "Origin");
+  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
 }
 
-function toAmount(value) {
-  const n = Number(value);
-  if (!Number.isFinite(n) || n <= 0) return null;
-  // YooKassa expects a string with 2 decimals
-  return n.toFixed(2);
-}
-
-export default async function handler(req, res) {
-  if (req.method !== "POST") return json(res, 405, { error: "Method Not Allowed" });
+module.exports = async (req, res) => {
+  cors(req, res);
+  if (req.method === "OPTIONS") return res.status(204).end();
+  if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
 
   try {
-    const body = typeof req.body === "string" ? JSON.parse(req.body) : (req.body || {});
-    const amountStr = toAmount(body.amount);
-    const orderId = String(body.orderId || "").trim();
-    const description = String(body.description || `Заказ #${orderId}`).slice(0, 128);
+    const { amount, description, return_url, metadata } = req.body || {};
 
-    if (!amountStr) return json(res, 400, { error: "Invalid amount" });
-    if (!orderId) return json(res, 400, { error: "Missing orderId" });
+    if (!amount || !Number(amount) || Number(amount) <= 0) {
+      return res.status(400).json({ error: "Bad amount" });
+    }
+    if (!return_url) return res.status(400).json({ error: "Missing return_url" });
 
     const shopId = process.env.YOOKASSA_SHOP_ID;
     const secret = process.env.YOOKASSA_SECRET_KEY;
-    if (!shopId || !secret) {
-      return json(res, 500, { error: "Missing YOOKASSA_SHOP_ID / YOOKASSA_SECRET_KEY env vars" });
-    }
-
-    const origin = req.headers.origin || process.env.SITE_URL || "";
-    const returnUrl = origin
-      ? `${origin.replace(/\/$/, "")}/?pay=return&order=${encodeURIComponent(orderId)}`
-      : `https://example.com/?pay=return&order=${encodeURIComponent(orderId)}`;
+    if (!shopId || !secret) return res.status(500).json({ error: "YooKassa env vars missing" });
 
     const idempotenceKey = crypto.randomUUID();
 
-    const auth = Buffer.from(`${shopId}:${secret}`).toString("base64");
-
     const payload = {
-      amount: { value: amountStr, currency: "RUB" },
+      amount: { value: Number(amount).toFixed(2), currency: "RUB" },
+      confirmation: { type: "redirect", return_url },
       capture: true,
-      confirmation: { type: "redirect", return_url: returnUrl },
-      description,
-      metadata: { order_id: orderId }
+      description: description || "Оплата заказа",
+      metadata: metadata || {}
     };
 
-    const resp = await fetch(`${YOOKASSA_API}/payments`, {
+    const r = await fetch("https://api.yookassa.ru/v3/payments", {
       method: "POST",
       headers: {
-        "Authorization": `Basic ${auth}`,
+        "Content-Type": "application/json",
         "Idempotence-Key": idempotenceKey,
-        "Content-Type": "application/json"
+        "Authorization": "Basic " + Buffer.from(`${shopId}:${secret}`).toString("base64")
       },
       body: JSON.stringify(payload)
     });
 
-    const data = await resp.json().catch(() => ({}));
+    const data = await r.json().catch(() => ({}));
 
-    if (!resp.ok) {
-      return json(res, resp.status, { error: "YooKassa error", details: data });
+    if (!r.ok) {
+      return res.status(r.status).json({ error: "YooKassa error", details: data });
     }
 
-    const confirmationUrl = data?.confirmation?.confirmation_url;
-    const paymentId = data?.id;
-
-    if (!confirmationUrl || !paymentId) {
-      return json(res, 502, { error: "Unexpected YooKassa response", details: data });
-    }
-
-    return json(res, 200, { payment_id: paymentId, confirmation_url: confirmationUrl });
+    return res.status(200).json({
+      payment_id: data.id,
+      status: data.status,
+      confirmation_url: data?.confirmation?.confirmation_url
+    });
   } catch (e) {
-    return json(res, 500, { error: "Server error", details: String(e?.message || e) });
+    return res.status(500).json({ error: "Server error", details: String(e) });
   }
-}
+};
